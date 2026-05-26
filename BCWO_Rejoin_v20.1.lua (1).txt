@@ -37,7 +37,7 @@ end)
 -- ============================================================
 --  ⚙️ WEBHOOK SETTINGS — PALITAN MO ITO!
 -- ============================================================
-local WEBHOOK_URL = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1508636002162573322/CUybn8hFVAZYhwJpAjWoUlE6yjN6PdnCcZ_EUxZ5XOqlGAbv00HrXLh808fioS44hlez"
 -- Paano kumuha ng webhook:
 -- 1. Pumunta sa iyong Discord server
 -- 2. Channel Settings → Integrations → Webhooks → New Webhook
