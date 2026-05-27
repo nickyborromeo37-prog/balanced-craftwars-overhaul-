@@ -1,0 +1,1859 @@
+--[[
+    ╔══════════════════════════════════════════════════════════╗
+    ║    BCWO AUTO REJOIN v25.0 + WEBHOOK EDITION              ║
+    ╠══════════════════════════════════════════════════════════╣
+    ║  FIX v25 — PRE-HM REJOIN FIXES:                          ║
+    ║  • Pre-HM (Flare, Blizzard, Night, etc) = mag-rejoin     ║
+    ║    AGAD kahit may isRejoinPending na                      ║
+    ║  • Dedup (lastScannedText) nire-reset sa bagong server    ║
+    ║    para hindi ma-skip ang Pre-HM sa bagong server         ║
+    ║  • Rare/HM biome → HOLD (hintayin mawala ang biome)      ║
+    ║  • GUI timer: malaki + progress bar, update every 1 sec   ║
+    ║    Berde→Dilaw→Pula→Asul(HOLD) depende sa estado          ║
+    ╚══════════════════════════════════════════════════════════╝
+]]
+
+-- ============================================================
+--  🔴 KILL SWITCH — I-terminate ang lahat ng lumang instances
+--  Para hindi mag-conflict kapag nag-execute ulit ng script
+-- ============================================================
+if _G.BCWO_Running then
+    _G.BCWO_Running = false  -- Patayin ang dati
+    task.wait(0.5)           -- Bigyan ng oras na mag-stop ang loops
+end
+_G.BCWO_Running = true  -- Irehistro ang bagong instance
+
+-- Alisin ang lumang GUI kung meron
+pcall(function()
+    local player = game:GetService("Players").LocalPlayer
+    local oldGui = player:WaitForChild("PlayerGui"):FindFirstChild("BCWOAutoRejoin")
+    if oldGui then oldGui:Destroy() end
+end)
+
+-- ============================================================
+--  ⚙️ WEBHOOK SETTINGS — PALITAN MO ITO!
+-- ============================================================
+local WEBHOOK_URL = "https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN"
+-- Paano kumuha ng webhook:
+-- 1. Pumunta sa iyong Discord server
+-- 2. Channel Settings → Integrations → Webhooks → New Webhook
+-- 3. I-copy ang Webhook URL at i-paste dito
+
+-- ============================================================
+--  SERVICES
+-- ============================================================
+local Players             = game:GetService("Players")
+local TeleportService     = game:GetService("TeleportService")
+local RunService          = game:GetService("RunService")
+local StarterGui          = game:GetService("StarterGui")
+local UserInputService    = game:GetService("UserInputService")
+local HttpService         = game:GetService("HttpService")
+local VirtualInputManager = pcall(function() return game:GetService("VirtualInputManager") end)
+    and game:GetService("VirtualInputManager") or nil
+
+-- ============================================================
+--  SETTINGS
+-- ============================================================
+local Settings = {
+    ShowNotifications        = true,
+    ShowGUI                  = true,
+    WebhookEnabled           = true,   -- I-toggle kung gusto mong i-off ang webhook
+    WebhookBiome             = true,   -- Notify sa Discord kapag may bagong biome
+    WebhookItems             = true,   -- Notify sa Discord kapag may nakuhang item
+    WebhookRejoin            = true,   -- Notify sa Discord kapag mag-re-rejoin
+
+    -- ⏱️ SERVER AGE AUTO-REJOIN
+    -- Kapag 1 oras na ang server, mag-auto-rejoin.
+    -- Kung may Rare/HM biome, maghihintay ng 5 minuto bago i-force rejoin.
+    ServerAgeRejoin      = true,   -- I-false kung ayaw ng 1-hour auto-rejoin
+    ServerAgeLimit       = 1740,   -- 29 minuto = 1740 seconds
+    -- (RareBiomeGracePeriod removed v22 — Rare biomes now just HOLD the timer, no grace)
+}
+
+-- ============================================================
+--  BIOME DETECTION LISTS
+-- ============================================================
+local GRASSLANDS_MESSAGES = {
+    "The world has returned to normal",
+    "The world has returned to normal.",
+    "The world has returned to normal?",
+}
+
+local PREHARDMODE_MESSAGES = {
+    "Magical flames have warped the island!",
+    "An incredibly strong blizzard is freezing the island!",
+    "The moon is rising!",
+    "The wind is sweeping life energy...",
+    "A powerful stormsurge has engulfed the island!",
+}
+
+local RARE_MESSAGES = {
+    -- Main Path (1/750)
+    "The war between pure and corrupt has started!",
+    "The pure and corrupt are at war!",
+    -- Main Path (1/1125)
+    "The war between holy and unholy has started!",
+    -- Main Path (1/2500)
+    "The void has infiltrated reality!",
+    "The angels of the sky are descending!",
+    -- Main Path (1/2500) - Crimson Sea
+    "Your actions created an imbalance in reality.",
+    -- Main Path Ultra (1/5000)
+    "A bright light is blinding the world!",
+    "The world is being shrouded in darkness!",
+    -- Main Path Ultra (1/7500)
+    "A cultist legion has invaded!",
+    -- Rare (1/600)
+    "The island is being irradiated!",
+    "Radiation is spreading across the island!",
+    "The stars are aligning...",
+    "A starry night has descended!",
+}
+
+-- ============================================================
+--  BIOME NAME MAP — spawn message → { name, emoji, rarity, color }
+-- ============================================================
+local BIOME_INFO = {
+    -- 🌿 GRASSLANDS
+    ["the world has returned to normal"]  = { name = "Grasslands",          emoji = "🌿", rarity = "Normal",           color = 3066993  },
+    ["the world has returned to normal."] = { name = "Grasslands",          emoji = "🌿", rarity = "Normal",           color = 3066993  },
+    ["the world has returned to normal?"] = { name = "Grasslands (HM)",     emoji = "🌿", rarity = "Normal",           color = 3066993  },
+
+    -- ⚔️ PRE-HARDMODE BIOMES
+    ["magical flames have warped the island!"]                = { name = "Flare Biome",   emoji = "🔥", rarity = "Pre-HM (1/180)",  color = 15105570 },
+    ["an incredibly strong blizzard is freezing the island!"] = { name = "Blizzard",      emoji = "❄️", rarity = "Pre-HM (1/180)",  color = 8900331  },
+    ["the moon is rising!"]                                   = { name = "Night",         emoji = "🌙", rarity = "Pre-HM (1/125)",  color = 4528128  },
+    ["the wind is sweeping life energy..."]                   = { name = "Nature Biome",  emoji = "🍃", rarity = "Pre-HM (1/180)",  color = 3066993  },
+    ["a powerful stormsurge has engulfed the island!"]        = { name = "Stormsurge",    emoji = "⛈️", rarity = "Pre-HM (1/180)",  color = 3447003  },
+
+    -- 🌟 HARDMODE MAIN PATH BIOMES
+    ["the war between pure and corrupt has started!"] = { name = "Pure vs Corrupt War", emoji = "⚔️", rarity = "Rare (1/750)",   color = 10181046 },
+    ["the pure and corrupt are at war!"]              = { name = "Pure vs Corrupt War", emoji = "⚔️", rarity = "Rare (1/750)",   color = 10181046 },
+    ["the war between holy and unholy has started!"]  = { name = "Holy vs Unholy War",  emoji = "🛡️", rarity = "Rare (1/1125)",  color = 16776960 },
+    ["the void has infiltrated reality!"]             = { name = "Void Infiltration",   emoji = "🌀", rarity = "Rare (1/2500)",  color = 4718592  },
+    ["the angels of the sky are descending!"]         = { name = "Angel's Descent",     emoji = "👼", rarity = "Rare (1/2500)",  color = 16777215 },
+    ["your actions created an imbalance in reality."] = { name = "Crimson Sea",         emoji = "🌊", rarity = "Rare (1/2500)",  color = 15158332 },
+    ["a bright light is blinding the world!"]         = { name = "Blinding Light",      emoji = "✨", rarity = "Ultra (1/5000)", color = 16777215 },
+    ["the world is being shrouded in darkness!"]      = { name = "Shrouding Darkness",  emoji = "🌑", rarity = "Ultra (1/5000)", color = 2303786  },
+    ["a cultist legion has invaded!"]                 = { name = "Cultist Legion",      emoji = "💀", rarity = "Ultra (1/7500)", color = 9699539  },
+
+    -- 🔬 RARE BIOMES
+    ["the island is being irradiated!"]           = { name = "Irradiated Biome", emoji = "☢️", rarity = "Rare (1/600)",  color = 8311585  },
+    ["radiation is spreading across the island!"] = { name = "Irradiated Biome", emoji = "☢️", rarity = "Rare (1/600)",  color = 8311585  },
+    ["the stars are aligning..."]                 = { name = "Starry Night",     emoji = "⭐", rarity = "Rare (1/600)",  color = 8900331  },
+    ["a starry night has descended!"]             = { name = "Starry Night",     emoji = "⭐", rarity = "Rare (1/600)",  color = 8900331  },
+}
+
+-- ============================================================
+--  ITEM RARITY FILTER — Rare, Legendary, Divine, Mythical lang
+-- ============================================================
+local ITEM_RARITIES = {
+    { tag = "[Rare]",      emoji = "🔵", color = 3447003  },
+    { tag = "[Epic]",      emoji = "🟣", color = 10181046 },
+    { tag = "[Legendary]", emoji = "🟠", color = 15105570 },
+    { tag = "[Divine]",    emoji = "🟡", color = 16776960 },
+    { tag = "[Mythical]",  emoji = "🔴", color = 15158332 },
+}
+
+-- ============================================================
+--  CLEAN FONT TAGS — Tanggalin ang <font color="..."> etc.
+-- ============================================================
+local function cleanMessage(msg)
+    if not msg then return "" end
+    -- Remove all XML/HTML tags like <font color="...">, </font>, <b>, etc.
+    msg = msg:gsub("<[^>]+>", "")
+    -- Decode HTML entities
+    msg = msg:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&apos;", "'")
+    -- Remove newlines
+    msg = msg:gsub("\n", " "):gsub("\r", "")
+    -- Trim whitespace
+    msg = msg:match("^%s*(.-)%s*$") or msg
+    return msg
+end
+
+-- ============================================================
+--  EXTRACT ITEM NAME — Kuhanin lang ang item name mula sa message
+--  Format: "You obtained [Legendary] Sword of Flames"
+--  Output: "Sword of Flames"
+-- ============================================================
+local function extractItemName(msg)
+    -- Try to get text after the rarity tag like [Legendary]
+    local itemName = msg:match("%[%a+%]%s*(.+)$")
+    if itemName then
+        return itemName:match("^%s*(.-)%s*$")
+    end
+    return msg
+end
+
+-- ============================================================
+--  STATE VARIABLES
+-- ============================================================
+local isRunning         = false
+local currentStatus     = "Idle"
+local currentBiome      = "Unknown"
+local isRareBiomeActive = false
+local isRejoinPending   = false
+local screenGui         = nil
+local statusLabel       = nil
+local biomeLabel        = nil
+local countLabel        = nil
+local serverAgeLabel    = nil  -- ⏱️ Server age countdown display
+
+-- ⏱️ SERVER AGE TIMER STATE
+local serverJoinTime    = tick()  -- Oras nang mag-join sa server
+-- (grace period removed in v22 — rare biomes now just pause/hold the timer)
+
+-- ✅ PERSISTENT REJOIN COUNT — gumagamit ng _G para hindi ma-reset
+-- kahit mag-teleport/rejoin sa bagong server
+if not _G.BCWO_RejoinCount then
+    _G.BCWO_RejoinCount = 0
+end
+local rejoinCount = _G.BCWO_RejoinCount
+
+-- Cooldown para hindi mag-spam ang webhook
+local lastWebhookTime       = 0
+local lastRejoinWebhookTime = 0
+local WEBHOOK_COOLDOWN      = 3
+
+-- ✅ FIX v30: Per-biome cooldown — bawat biome ay SARILING 30s timer
+-- Dati iisang lastBiomeWebhookTime lang — kapag nag-notify ang Blizzard,
+-- nabo-block niya ang Irradiated/Starry Night/lahat ng iba sa 5s
+-- Ngayon: Irradiated ≠ Blizzard ≠ Starry Night, hindi na nagtatamaan
+local BIOME_WEBHOOK_CD    = 30  -- 30s per biome
+local lastBiomeNotifyTime = {}  -- key = biome name
+
+-- Para hindi mag-duplicate ang biome notify
+local lastBiomeNotified = ""
+
+-- ✅ FIX v24: formatTime defined HERE (before createGUI)
+-- Kailangan dito para ma-access ng 1-second timer loop sa loob ng createGUI
+local function formatTime(seconds)
+    local m = math.floor(seconds / 60)
+    local s = math.floor(seconds % 60)
+    return string.format("%d:%02d", m, s)
+end
+
+-- ============================================================
+--  WEBHOOK FUNCTION
+-- ============================================================
+local function sendWebhook(title, description, color, fields, skipCooldown)
+    if not Settings.WebhookEnabled then return end
+    if not WEBHOOK_URL or WEBHOOK_URL:find("YOUR_WEBHOOK") then
+        warn("[WEBHOOK] Hindi pa na-set ang WEBHOOK_URL! Palitan mo sa taas ng script.")
+        return
+    end
+
+    -- ✅ FIX v8: skipCooldown=true para sa biome/rejoin webhooks
+    -- Sila may sariling cooldown na, hindi na kailangan ng global check
+    if not skipCooldown then
+        local now = tick()
+        if now - lastWebhookTime < WEBHOOK_COOLDOWN then return end
+        lastWebhookTime = now
+    end
+
+    local player = Players.LocalPlayer
+    local playerName = player and player.Name or "Unknown"
+
+    local embedFields = {
+        { name = "👤 Player", value = playerName, inline = true },
+        { name = "🕐 Time",   value = os.date("%H:%M:%S"), inline = true },
+    }
+    if fields then
+        for _, f in ipairs(fields) do
+            table.insert(embedFields, f)
+        end
+    end
+
+    local ok, payload = pcall(function()
+        return HttpService:JSONEncode({
+            username = "BCWO Auto Rejoin",
+            embeds = {
+                {
+                    title       = title,
+                    description = description,
+                    color       = color or 3066993,
+                    fields      = embedFields,
+                    footer      = { text = "BCWO Auto Rejoin v20.1 | Rejoins: " .. rejoinCount },
+                    timestamp   = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                }
+            }
+        })
+    end)
+
+    if not ok then
+        warn("[WEBHOOK] ❌ JSON encode failed: " .. tostring(payload))
+        return
+    end
+
+    print("[WEBHOOK] 📤 Attempting to send: " .. tostring(title))
+
+    task.spawn(function()
+        local sent = false
+
+        -- ============================================================
+        --  AUTO-DETECT EXECUTOR TYPE
+        -- ============================================================
+        local executorName = "Unknown"
+        pcall(function()
+            if identifyexecutor then
+                executorName = identifyexecutor() or "Unknown"
+            elseif DELTA_VERSION then
+                executorName = "Delta"
+            elseif syn then
+                executorName = "Synapse"
+            end
+        end)
+        print("[WEBHOOK] Executor: " .. executorName)
+
+        -- ============================================================
+        --  Method 1: request() — Delta / Codex / Wave (PINAKA-COMMON)
+        -- ============================================================
+        if not sent then
+            local s, e = pcall(function()
+                if request then
+                    local res = request({
+                        Url     = WEBHOOK_URL,
+                        Method  = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body    = payload,
+                    })
+                    local code = tostring(res and res.StatusCode or "nil")
+                    print("[WEBHOOK] request() → StatusCode: " .. code)
+                    if res and res.StatusCode then
+                        sent = true
+                    end
+                else
+                    print("[WEBHOOK] request() → NOT AVAILABLE")
+                end
+            end)
+            if not s then warn("[WEBHOOK] request() error: " .. tostring(e)) end
+        end
+
+        -- ============================================================
+        --  Method 2: http_request() — Delta alt / ilang executors
+        -- ============================================================
+        if not sent then
+            local s, e = pcall(function()
+                if http_request then
+                    local res = http_request({
+                        Url     = WEBHOOK_URL,
+                        Method  = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body    = payload,
+                    })
+                    local code = tostring(res and res.StatusCode or "nil")
+                    print("[WEBHOOK] http_request() → StatusCode: " .. code)
+                    if res and res.StatusCode then
+                        sent = true
+                    end
+                else
+                    print("[WEBHOOK] http_request() → NOT AVAILABLE")
+                end
+            end)
+            if not s then warn("[WEBHOOK] http_request() error: " .. tostring(e)) end
+        end
+
+        -- ============================================================
+        --  Method 3: syn.request — Synapse X / Synapse Z
+        -- ============================================================
+        if not sent then
+            local s, e = pcall(function()
+                if syn and syn.request then
+                    local res = syn.request({
+                        Url     = WEBHOOK_URL,
+                        Method  = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body    = payload,
+                    })
+                    local code = tostring(res and res.StatusCode or "nil")
+                    print("[WEBHOOK] syn.request → StatusCode: " .. code)
+                    if res and res.StatusCode then
+                        sent = true
+                    end
+                else
+                    print("[WEBHOOK] syn.request → NOT AVAILABLE")
+                end
+            end)
+            if not s then warn("[WEBHOOK] syn.request error: " .. tostring(e)) end
+        end
+
+        -- ============================================================
+        --  Method 4: http.request — KRNL / Fluxus
+        -- ============================================================
+        if not sent then
+            local s, e = pcall(function()
+                if http and http.request then
+                    local res = http.request({
+                        Url     = WEBHOOK_URL,
+                        Method  = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body    = payload,
+                    })
+                    local code = tostring(res and res.StatusCode or "nil")
+                    print("[WEBHOOK] http.request → StatusCode: " .. code)
+                    if res and res.StatusCode then
+                        sent = true
+                    end
+                else
+                    print("[WEBHOOK] http.request → NOT AVAILABLE")
+                end
+            end)
+            if not s then warn("[WEBHOOK] http.request error: " .. tostring(e)) end
+        end
+
+        if not sent then
+            warn("[WEBHOOK] ❌ LAHAT NG METHOD AY FAILED.")
+            warn("[WEBHOOK]    Tingnan ang console output sa taas para malaman kung bakit.")
+            warn("[WEBHOOK]    Common fixes:")
+            warn("[WEBHOOK]      1. I-check kung tama ang WEBHOOK_URL format")
+            warn("[WEBHOOK]      2. I-enable ang HTTP requests sa executor settings mo")
+            warn("[WEBHOOK]      3. Subukan i-restart ang executor")
+        else
+            print("[WEBHOOK] ✅ Sent: " .. tostring(title))
+        end
+    end)
+end
+
+-- ============================================================
+--  WEBHOOK TEST — I-call ito sa console para i-test:
+--    _G.BCWO_TestWebhook()
+-- ============================================================
+_G.BCWO_TestWebhook = function()
+    print("[WEBHOOK TEST] Sinusubukan ang webhook connection...")
+    if not WEBHOOK_URL or WEBHOOK_URL:find("YOUR_WEBHOOK") then
+        warn("[WEBHOOK TEST] ❌ Hindi pa na-set ang WEBHOOK_URL!")
+        warn("[WEBHOOK TEST]    Buksan ang script, hanapin ang WEBHOOK_URL")
+        warn("[WEBHOOK TEST]    at palitan ng iyong Discord webhook URL.")
+        return
+    end
+    print("[WEBHOOK TEST] URL: " .. WEBHOOK_URL:sub(1, 50) .. "...")
+    sendWebhook(
+        "✅ BCWO Webhook Test",
+        "Kung nakita mo ito sa Discord, gumagana ang webhook!",
+        3066993,
+        { { name = "🔧 Status", value = "Test Successful", inline = true } },
+        true
+    )
+end
+print("[WEBHOOK] Para i-test ang webhook, i-run sa console: _G.BCWO_TestWebhook()")
+
+-- ============================================================
+--  WEBHOOK HELPERS — para sa iba't ibang sitwasyon
+-- ============================================================
+local function webhookBiome(biomeType, message)
+    if not Settings.WebhookBiome then return end
+
+    local cleaned = cleanMessage(message)
+    local key     = cleaned:lower()
+    local info    = BIOME_INFO[key]
+
+    -- Fallback kung hindi nahanap sa exact key
+    if not info then
+        for k, v in pairs(BIOME_INFO) do
+            if key:find(k, 1, true) or k:find(key, 1, true) then
+                info = v
+                break
+            end
+        end
+    end
+
+    local name, emoji, rarity, color
+
+    if info then
+        name   = info.name
+        emoji  = info.emoji
+        rarity = info.rarity
+        color  = info.color
+    else
+        if biomeType == "PREHM" then
+            name = "Pre-HM Biome"; emoji = "⚔️"; rarity = "Pre-HM"; color = 15158332
+        elseif biomeType == "RARE" then
+            name = "Rare Biome"; emoji = "🌟"; rarity = "Rare"; color = 15844367
+        else
+            name = "Grasslands"; emoji = "🌿"; rarity = "Normal"; color = 3066993
+        end
+    end
+
+    -- ✅ FIX v30: Per-biome cooldown gamit ang biome name bilang key
+    -- Bawat biome ay may sariling 30s cooldown — hindi na nagtatamaan
+    local now = tick()
+    local lastNotify = lastBiomeNotifyTime[name] or 0
+    if now - lastNotify < BIOME_WEBHOOK_CD then
+        print("[WEBHOOK SKIP] " .. name .. " — cooldown (" .. math.floor(BIOME_WEBHOOK_CD - (now - lastNotify)) .. "s left)")
+        return
+    end
+    lastBiomeNotifyTime[name] = now
+
+    local action
+    if biomeType == "PREHM" then
+        action = "AUTO REJOIN 🔄"
+    elseif biomeType == "RARE" then
+        action = "STAYING ✅"
+    else
+        action = "STAYING 🌿"
+    end
+
+    sendWebhook(
+        emoji .. " " .. name .. " Detected!",
+        "**Rarity:** " .. rarity .. "\n**Biome Message:** " .. cleaned,
+        color,
+        {
+            { name = "⚡ Action",  value = action,    inline = true },
+            { name = "🎯 Type",   value = biomeType, inline = true },
+        },
+        true  -- skipCooldown
+    )
+end
+
+
+
+local function webhookRejoin(count, reason)
+    if not Settings.WebhookRejoin then return end
+
+    -- ✅ FIX v8: Sariling cooldown ng rejoin webhook
+    local now = tick()
+    if now - lastRejoinWebhookTime < 10 then return end  -- max 1 rejoin notify per 10s
+    lastRejoinWebhookTime = now
+
+    sendWebhook(
+        "🔄 Auto Rejoin #" .. count,
+        "Nag-rejoin dahil sa: **" .. (reason or "Unknown") .. "**",
+        16776960,  -- yellow
+        {
+            { name = "🔢 Rejoin Count", value = tostring(count), inline = true },
+            { name = "📍 Place ID",     value = tostring(game.PlaceId), inline = true },
+        },
+        true  -- skipCooldown
+    )
+end
+
+-- ============================================================
+--  UTILITY FUNCTIONS
+-- ============================================================
+
+local function notify(title, text, duration)
+    if not Settings.ShowNotifications then return end
+    duration = duration or 5
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title    = title,
+            Text     = text,
+            Duration = duration,
+        })
+    end)
+end
+
+local function updateStatus(status, biome)
+    currentStatus = status or currentStatus
+    currentBiome  = biome  or currentBiome
+    if statusLabel then statusLabel.Text = "Status: " .. currentStatus end
+    if biomeLabel  then biomeLabel.Text  = "Biome: "  .. currentBiome  end
+    if countLabel  then countLabel.Text  = "Rejoins: " .. rejoinCount  end
+end
+
+local function pressKey(keyCode)
+    if not VirtualInputManager then return false end
+    local success = pcall(function()
+        VirtualInputManager:SendKeyEvent(true,  keyCode, false, game)
+        task.wait(0.15)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+    end)
+    return success
+end
+
+local function containsAny(message, list)
+    local lower = message:lower()
+    for _, phrase in ipairs(list) do
+        if lower:find(phrase:lower(), 1, true) then
+            return true, phrase
+        end
+    end
+    return false, nil
+end
+
+-- ============================================================
+--  TRUE INFINITE YIELD STYLE REJOIN
+-- ============================================================
+local function doRejoin(reason)
+    rejoinCount = rejoinCount + 1
+    _G.BCWO_RejoinCount = rejoinCount  -- ✅ I-save sa _G para persistent
+
+    print("[TRUE IY REJOIN] Kick self → TeleportToNewServer... (#" .. rejoinCount .. ")")
+    updateStatus("🔗 Disconnecting & Rejoining... (#" .. rejoinCount .. ")", currentBiome)
+    notify("BCWO Auto Rejoin", "Disconnecting from server... (#" .. rejoinCount .. ")", 3)
+
+    -- Send webhook BEFORE rejoin
+    webhookRejoin(rejoinCount, reason or currentBiome)
+
+    local targetPlaceId = game.PlaceId
+    local player        = Players.LocalPlayer
+
+    task.wait(0.3)
+
+    -- ✅ FIX v7: SAFETY TIMEOUT — kung hindi pa nag-teleport after 90s,
+    -- i-reset ang isRejoinPending para hindi permanently ma-lock ang detection
+    task.spawn(function()
+        task.wait(90)
+        if isRejoinPending then
+            print("[SAFETY TIMEOUT] Rejoin took too long — resetting isRejoinPending.")
+            isRejoinPending = false
+            updateStatus("⚠️ Rejoin timeout — reset. Waiting...", currentBiome)
+        end
+    end)
+
+    task.spawn(function()
+        local attempt = 0
+        local maxAttempts = 10  -- Force retry hanggang 10x
+
+        while _G.BCWO_Running do
+            attempt = attempt + 1
+            print("[FORCE REJOIN] Attempt #" .. attempt)
+            updateStatus("🔄 Force Rejoin attempt #" .. attempt .. "...", currentBiome)
+
+            -- Method 1: Kick + TeleportToNewServer
+            local kicked = false
+            pcall(function()
+                player:Kick("[Auto-Rejoin] Pre-HM detected — force rejoining...")
+                kicked = true
+            end)
+
+            task.wait(0.5)
+
+            -- Method 2: TeleportToNewServer
+            local s1 = false
+            pcall(function()
+                TeleportService:TeleportToNewServer(targetPlaceId)
+                s1 = true
+            end)
+            if s1 then
+                print("[FORCE REJOIN] ✓ TeleportToNewServer SUCCESS (attempt #" .. attempt .. ")")
+                return
+            end
+
+            task.wait(0.3)
+
+            -- Method 3: Teleport
+            local s2 = false
+            pcall(function()
+                TeleportService:Teleport(targetPlaceId, player)
+                s2 = true
+            end)
+            if s2 then
+                print("[FORCE REJOIN] ✓ Teleport() SUCCESS (attempt #" .. attempt .. ")")
+                return
+            end
+
+            task.wait(0.3)
+
+            -- Method 4: TeleportAsync
+            local s3 = false
+            pcall(function()
+                local opts = Instance.new("TeleportOptions")
+                opts.ShouldReserveServer = false
+                TeleportService:TeleportAsync(targetPlaceId, {player}, opts)
+                s3 = true
+            end)
+            if s3 then
+                print("[FORCE REJOIN] ✓ TeleportAsync() SUCCESS (attempt #" .. attempt .. ")")
+                return
+            end
+
+            -- Method 5: game:Shutdown() — last resort
+            if attempt >= 3 then
+                pcall(function()
+                    print("[FORCE REJOIN] Trying game shutdown method...")
+                    game:GetService("TeleportService"):TeleportToNewServer(game.PlaceId)
+                end)
+            end
+
+            if attempt >= maxAttempts then
+                print("[FORCE REJOIN] ✗ Max attempts reached! Giving up.")
+                -- ✅ FIX v7: I-reset ang lock para ang susunod na Pre-HM ay maka-trigger ulit
+                isRejoinPending = false
+                updateStatus("❌ Force Rejoin FAILED after " .. maxAttempts .. " tries", currentBiome)
+                notify("❌ REJOIN FAILED", "Hindi makapag-rejoin after " .. maxAttempts .. " attempts!", 8)
+                return
+            end
+
+            -- Wait bago mag-retry
+            local waitTime = math.min(2 * attempt, 10)  -- 2s, 4s, 6s... max 10s
+            print("[FORCE REJOIN] All methods failed, retrying in " .. waitTime .. "s...")
+            updateStatus("⏳ Retry #" .. attempt .. " in " .. waitTime .. "s...", currentBiome)
+            notify("⏳ Retrying rejoin...", "Attempt #" .. attempt .. " failed, retrying...", waitTime)
+            task.wait(waitTime)
+        end
+    end)
+end
+
+-- ============================================================
+--  ITEM DROP DETECTION — Rare/Legendary/Divine/Mythical lang
+-- ============================================================
+local function checkForItemDrop(message)
+    if not Settings.WebhookItems then return end
+
+    local cleaned = cleanMessage(message)
+    local lower   = cleaned:lower()
+
+    for _, rarity in ipairs(ITEM_RARITIES) do
+        if lower:find(rarity.tag:lower(), 1, true) then
+            local itemName = extractItemName(cleaned)
+            local rarityName = rarity.tag:gsub("[%[%]]", "")
+
+            print("[ITEM DROP] " .. rarityName .. ": " .. itemName)
+
+            -- Clean Discord notification — pangalan lang ng item
+            sendWebhook(
+                rarity.emoji .. " " .. rarityName .. " Item!",
+                "**" .. itemName .. "**",
+                rarity.color,
+                {}
+            )
+
+            notify(rarity.emoji .. " " .. rarityName .. "!", itemName, 6)
+            return
+        end
+    end
+end
+
+-- ============================================================
+--  BIOME LISTENER / CHAT HOOK
+-- ============================================================
+local function onChatMessage(message)
+    if not isRunning then return end
+
+    -- ✅ FIX v7: I-clean MUNA ang message para matanggal ang font tags
+    message = cleanMessage(message)
+
+    -- ✅ FIX v20: Debug — ipakita lahat ng messages na dumadating
+    if #message > 3 then
+        print("[MSG DEBUG] " .. tostring(message):sub(1, 80))
+    end
+
+    -- Check for item drops in every message
+    checkForItemDrop(message)
+
+    -- ✅ PRE-HM → LAGING MAG-REJOIN (walang exception)
+    local isPreHM, preHMPhrase = containsAny(message, PREHARDMODE_MESSAGES)
+    if isPreHM then
+        -- 🔒 GUARD: Kung nag-rerejoin na, huwag mag-trigger ulit
+        if isRejoinPending then
+            print("[GUARD] Pre-HM detected pero nag-rerejoin na — SKIP")
+            return
+        end
+        isRejoinPending = true  -- 🔒 I-lock agad para hindi mag-stack
+        isRareBiomeActive = false
+        -- ✅ FIX v12: I-set ang lastBiomeNotified sa PreHM phrase para
+        --             hindi ma-retrigger ng scanForBiomeInGUI/Workspace
+        local triggerMsg = preHMPhrase or message
+        lastBiomeNotified = triggerMsg:lower()
+
+        local biomeName = triggerMsg
+        updateStatus("⚔️ Pre-HM Detected! Rejoining...", biomeName:sub(1, 40))
+        notify("⚔️ Pre-HM Biome!", "Switching to new server...", 3)
+
+        -- ✅ FIX v8: I-send ang webhook notification para sa Pre-HM biome
+        -- (Dati wala itong webhook — ito ang pangunahing bug!)
+        webhookBiome("PREHM", biomeName)
+
+        task.spawn(function() doRejoin(biomeName) end)
+        return
+    end
+
+    -- ✅ RARE/HARDMODE → LAGING MAG-STAY
+    local isRare, rarePhrase = containsAny(message, RARE_MESSAGES)
+    if isRare then
+        -- ✅ I-reset MUNA ang flags bago mag-dedup check
+        isRareBiomeActive = true
+        isRejoinPending   = false  -- PALAGING nire-reset kahit duplicate ang message
+
+        -- 🔒 DEDUP GUARD: base sa raw phrase para hindi ma-block ang ibang messages
+        -- ng parehong biome (e.g. "The stars are aligning..." vs "A starry night has descended!")
+        local phrase = (rarePhrase or message):lower()
+        if lastBiomeNotified == phrase then return end
+        lastBiomeNotified = phrase
+
+        local info = BIOME_INFO[phrase]
+        local biomeName = info and info.name or phrase
+        local biomeEmoji = info and info.emoji or "🌟"
+
+        updateStatus(biomeEmoji .. " " .. biomeName .. " — Staying...", biomeName)
+        notify(biomeEmoji .. " " .. biomeName, "Rare biome detected! Staying...", 8)
+        webhookBiome("RARE", rarePhrase or message)
+        return
+    end
+
+    -- 🌿 GRASSLANDS → reset lahat at stay
+    local isGrass = containsAny(message, GRASSLANDS_MESSAGES)
+    if isGrass then
+        -- ✅ FIX v12: Dedup check MUNA bago i-clear ang lastBiomeNotified
+        local phrase = message:lower()
+        if lastBiomeNotified == phrase then return end
+
+        -- Reset flags pagkatapos ng dedup check
+        isRareBiomeActive = false
+        isRejoinPending   = false
+        lastBiomeNotified = phrase  -- ✅ I-set sa phrase (hindi blank) para mag-dedup nang tama
+
+        updateStatus("🌿 Grasslands - Staying...", "Grasslands")
+        notify("🌿 Grasslands", "Waiting for biome...", 4)
+        webhookBiome("GRASSLANDS", message)
+        return
+    end
+end
+
+local function hookChat()
+    local player = Players.LocalPlayer
+
+    -- ============================================================
+    --  METHOD 1: TextChatService root-level hook (PINAKA-MABILIS)
+    --  ✅ FIX v13: Biome announcements ay SYSTEM messages —
+    --  direktang i-hook ang TextChatService mismo, hindi lang channels
+    -- ============================================================
+    pcall(function()
+        local TextChatService = game:GetService("TextChatService")
+        if TextChatService then
+            -- MessageReceived — player + some system messages
+            TextChatService.MessageReceived:Connect(function(msg)
+                if msg and msg.Text then
+                    print("[TCS.MessageReceived] " .. tostring(msg.Text):sub(1,60))
+                    onChatMessage(msg.Text)
+                end
+            end)
+            print("[CHAT HOOK] ✅ TextChatService.MessageReceived hooked (root)")
+
+            -- ✅ FIX v20: OnIncomingMessage — catches ALL system messages
+            -- Ito ang pinaka-maaasahan para sa BCWO biome announcements
+            -- (Pre-HM, Rare, Grasslands — lahat ay dumadaan dito)
+            pcall(function()
+                TextChatService.OnIncomingMessage = function(msg)
+                    if msg and msg.Text then
+                        print("[TCS.OnIncomingMessage] " .. tostring(msg.Text):sub(1,60))
+                        onChatMessage(msg.Text)
+                    end
+                    return msg  -- ibalik para hindi masira ang chat UI
+                end
+                print("[CHAT HOOK] ✅ TextChatService.OnIncomingMessage hooked (v20)!")
+            end)
+        end
+    end)
+
+    -- ============================================================
+    --  METHOD 2: Hook bawat TextChannel kasama ang RBXSystem
+    --  RBXSystem = channel ng BCWO para sa biome messages
+    -- ============================================================
+    pcall(function()
+        local TextChatService = game:GetService("TextChatService")
+        if not TextChatService then return end
+
+        local function hookChannel(channel)
+            if not channel:IsA("TextChannel") then return end
+            channel.MessageReceived:Connect(function(msg)
+                if msg and msg.Text then onChatMessage(msg.Text) end
+            end)
+            print("[CHAT HOOK] ✅ Channel hooked: " .. channel.Name)
+        end
+
+        local function hookAllUnder(parent)
+            for _, child in ipairs(parent:GetChildren()) do
+                hookChannel(child)
+                pcall(function()
+                    for _, sub in ipairs(child:GetChildren()) do
+                        hookChannel(sub)
+                    end
+                end)
+            end
+        end
+
+        local channels = TextChatService:FindFirstChild("TextChannels")
+        if channels then
+            hookAllUnder(channels)
+            channels.ChildAdded:Connect(hookChannel)
+        end
+
+        task.spawn(function()
+            local ch2 = TextChatService:WaitForChild("TextChannels", 10)
+            if ch2 then
+                hookAllUnder(ch2)
+                ch2.ChildAdded:Connect(hookChannel)
+            end
+        end)
+    end)
+
+    -- ============================================================
+    --  METHOD 2B: Direct RBXSystem hook — FIX v20
+    --  BCWO biome announcements (Pre-HM, Rare, Grasslands) ay
+    --  nasa RBXSystem channel — i-hook nang direkta para sigurado
+    -- ============================================================
+    pcall(function()
+        local TextChatService = game:GetService("TextChatService")
+        if not TextChatService then return end
+
+        local function tryHookRBXSystem()
+            local channels = TextChatService:FindFirstChild("TextChannels")
+            if not channels then return false end
+            local rbxSystem = channels:FindFirstChild("RBXSystem")
+            if not rbxSystem then return false end
+            rbxSystem.MessageReceived:Connect(function(msg)
+                if msg and msg.Text then
+                    print("[RBXSystem] 📨 " .. tostring(msg.Text):sub(1,60))
+                    onChatMessage(msg.Text)
+                end
+            end)
+            print("[CHAT HOOK] ✅ RBXSystem hooked directly (METHOD 2B)!")
+            return true
+        end
+
+        if not tryHookRBXSystem() then
+            task.spawn(function()
+                local channels = TextChatService:WaitForChild("TextChannels", 15)
+                if not channels then return end
+                local rbxSystem = channels:WaitForChild("RBXSystem", 15)
+                if not rbxSystem then return end
+                rbxSystem.MessageReceived:Connect(function(msg)
+                    if msg and msg.Text then
+                        print("[RBXSystem DELAYED] 📨 " .. tostring(msg.Text):sub(1,60))
+                        onChatMessage(msg.Text)
+                    end
+                end)
+                print("[CHAT HOOK] ✅ RBXSystem hooked delayed (METHOD 2B)!")
+            end)
+        end
+    end)
+
+    -- ============================================================
+    --  METHOD 3: Legacy Chat
+    -- ============================================================
+    pcall(function()
+        local Chat = game:GetService("Chat")
+        if Chat then
+            Chat.Chatted:Connect(function(part, message, color)
+                if message then onChatMessage(message) end
+            end)
+            print("[CHAT HOOK] ✅ Legacy Chat.Chatted hooked")
+        end
+    end)
+
+    -- ============================================================
+    --  METHOD 4: Player.Chatted fallback
+    -- ============================================================
+    Players.PlayerAdded:Connect(function(p)
+        p.Chatted:Connect(function(msg) onChatMessage(msg) end)
+    end)
+    for _, p in ipairs(Players:GetPlayers()) do
+        p.Chatted:Connect(function(msg) onChatMessage(msg) end)
+    end
+
+    -- ============================================================
+    --  METHOD 5: DescendantAdded watcher sa Chat scroll frame
+    --  Direkta sa chat UI — instant detect kapag may bagong label
+    -- ============================================================
+    task.spawn(function()
+        local chatFrame = nil
+        local attempts  = 0
+
+        -- Hanapin ang chat scroll/frame sa PlayerGui
+        while not chatFrame and attempts < 20 do
+            attempts = attempts + 1
+            task.wait(1)
+            pcall(function()
+                local pg = player:FindFirstChild("PlayerGui")
+                if not pg then return end
+                for _, gui in ipairs(pg:GetDescendants()) do
+                    if (gui:IsA("ScrollingFrame") or gui:IsA("Frame"))
+                        and gui.Name:lower():find("chat") then
+                        chatFrame = gui
+                        break
+                    end
+                end
+            end)
+        end
+
+        if chatFrame then
+            print("[CHAT WATCHER] ✅ Chat frame found: " .. chatFrame:GetFullName())
+            chatFrame.DescendantAdded:Connect(function(obj)
+                if obj:IsA("TextLabel") or obj:IsA("TextBox") then
+                    task.wait(0.05)  -- kaunting delay para ma-populate ang .Text
+                    local text = obj.Text
+                    if text and #text > 5 then
+                        local cleaned = cleanMessage(text)
+                        local isBiome = containsAny(cleaned, PREHARDMODE_MESSAGES)
+                            or containsAny(cleaned, RARE_MESSAGES)
+                            or containsAny(cleaned, GRASSLANDS_MESSAGES)
+                        if isBiome then
+                            print("[CHAT WATCHER] 🔔 Biome from chat UI: " .. cleaned)
+                            onChatMessage(cleaned)
+                        end
+                    end
+                end
+            end)
+        else
+            print("[CHAT WATCHER] ⚠️ Chat frame not found — other methods active")
+        end
+    end)
+end
+
+-- Backup: scan PlayerGui text labels para sa biome messages
+-- May tracker para hindi paulit-ulit mag-fire ang parehong text
+local function scanForBiomeInGUI()
+    task.spawn(function()
+        local lastScannedText = ""
+        local lastJobId = game.JobId  -- ✅ FIX v25: i-track ang server para ma-reset dedup
+        while _G.BCWO_Running do
+            task.wait(0.5)
+            if not isRunning then task.wait(1) continue end
+
+            -- ✅ FIX v25: I-reset ang dedup kapag bagong server na
+            if game.JobId ~= lastJobId then
+                lastJobId = game.JobId
+                lastScannedText = ""
+            end
+
+            -- ✅ FIX v25: HUWAG i-block ang Pre-HM kahit may isRejoinPending
+            -- (dati naka-skip lahat kapag may pending — kaya hindi nag-rerejoin ang Pre-HM)
+            pcall(function()
+                local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
+                for _, gui in ipairs(playerGui:GetDescendants()) do
+                    if gui:IsA("TextLabel") or gui:IsA("TextBox") then
+                        local text = gui.Text
+                        if text and #text > 5 then
+                            local cleaned = cleanMessage(text)
+                            local lower = cleaned:lower()
+
+                            -- ✅ Pre-HM: palaging i-check, kahit may isRejoinPending
+                            local isPreHM, preHMPhrase = containsAny(lower, PREHARDMODE_MESSAGES)
+                            if isPreHM and cleaned ~= lastScannedText then
+                                lastScannedText = cleaned
+                                onChatMessage(cleaned)
+                                return  -- stop scan, na-detect na
+                            end
+
+                            -- Rare/Grasslands: normal dedup lang
+                            if not isRejoinPending then
+                                local isBiome = containsAny(lower, RARE_MESSAGES)
+                                    or containsAny(lower, GRASSLANDS_MESSAGES)
+                                if isBiome and cleaned ~= lastScannedText then
+                                    lastScannedText = cleaned
+                                    onChatMessage(cleaned)
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+end
+
+-- Backup: scan Workspace text labels para sa biome messages
+local function scanWorkspaceForBiomes()
+    task.spawn(function()
+        local lastScannedText = ""
+        local lastJobId = game.JobId  -- ✅ FIX v25: track server para ma-reset dedup
+        while _G.BCWO_Running do
+            task.wait(1)
+            if not isRunning then task.wait(1) continue end
+
+            -- ✅ FIX v25: I-reset ang dedup kapag bagong server na
+            if game.JobId ~= lastJobId then
+                lastJobId = game.JobId
+                lastScannedText = ""
+            end
+
+            pcall(function()
+                for _, obj in ipairs(workspace:GetDescendants()) do
+                    if obj:IsA("TextLabel") or obj:IsA("TextBox") then
+                        local text = obj.Text
+                        if text and #text > 10 then
+                            local cleaned = cleanMessage(text)
+                            local lower = cleaned:lower()
+
+                            -- ✅ Pre-HM: palaging i-check, kahit may isRejoinPending
+                            local isPreHM = containsAny(lower, PREHARDMODE_MESSAGES)
+                            if isPreHM and cleaned ~= lastScannedText then
+                                lastScannedText = cleaned
+                                onChatMessage(cleaned)
+                                return
+                            end
+
+                            -- Rare/Grasslands: normal lang
+                            if not isRejoinPending then
+                                local isBiome = containsAny(lower, RARE_MESSAGES)
+                                    or containsAny(lower, GRASSLANDS_MESSAGES)
+                                if isBiome and cleaned ~= lastScannedText then
+                                    lastScannedText = cleaned
+                                    onChatMessage(cleaned)
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+--  IMMEDIATE BIOME SCAN ON LOAD — ✅ FIX v15
+--  One-shot scan agad pagkatapos mag-load ng script
+--  para makuha ang biome na KASALUKUYANG AKTIBO sa server
+--  (hindi lang naghihintay ng bagong message)
+-- ============================================================
+local function scanCurrentBiomeOnLoad()
+    task.spawn(function()
+        -- Hintayin ng kaunti para ma-load ang GUI at chat UI
+        task.wait(1.5)
+        if not isRunning then return end
+
+        print("[ON-LOAD SCAN] Scanning current biome state...")
+
+        local found = false
+
+        -- Scan PlayerGui
+        pcall(function()
+            local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui", 5)
+            if not playerGui then return end
+            for _, obj in ipairs(playerGui:GetDescendants()) do
+                if found then break end
+                if obj:IsA("TextLabel") or obj:IsA("TextBox") then
+                    local text = obj.Text
+                    if text and #text > 5 then
+                        local cleaned = cleanMessage(text)
+                        local isPreHM = containsAny(cleaned, PREHARDMODE_MESSAGES)
+                        local isRare  = containsAny(cleaned, RARE_MESSAGES)
+                        local isGrass = containsAny(cleaned, GRASSLANDS_MESSAGES)
+                        if isPreHM or isRare or isGrass then
+                            print("[ON-LOAD SCAN] Found biome text: " .. cleaned)
+                            onChatMessage(cleaned)
+                            found = true
+                        end
+                    end
+                end
+            end
+        end)
+
+        -- Scan Workspace din
+        if not found then
+            pcall(function()
+                for _, obj in ipairs(workspace:GetDescendants()) do
+                    if found then break end
+                    if obj:IsA("TextLabel") or obj:IsA("TextBox") then
+                        local text = obj.Text
+                        if text and #text > 5 then
+                            local cleaned = cleanMessage(text)
+                            local isPreHM = containsAny(cleaned, PREHARDMODE_MESSAGES)
+                            local isRare  = containsAny(cleaned, RARE_MESSAGES)
+                            local isGrass = containsAny(cleaned, GRASSLANDS_MESSAGES)
+                            if isPreHM or isRare or isGrass then
+                                print("[ON-LOAD SCAN] Found biome in workspace: " .. cleaned)
+                                onChatMessage(cleaned)
+                                found = true
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        if found then
+            print("[ON-LOAD SCAN] ✅ Biome detected on load!")
+        else
+            -- Kung walang nakitang biome, i-set as Grasslands (default)
+            print("[ON-LOAD SCAN] No biome text found — assuming Grasslands")
+            updateStatus("🌿 Grasslands - Staying...", "Grasslands")
+        end
+    end)
+end
+
+-- ============================================================
+--  GUI CREATION
+-- ============================================================
+local mainFrame   = nil  -- reference para sa toggle
+local isGuiHidden = false
+
+local function createGUI()
+    if not Settings.ShowGUI then return end
+    if screenGui then pcall(function() screenGui:Destroy() end) end
+
+    local player    = Players.LocalPlayer
+    local playerGui = player:WaitForChild("PlayerGui")
+
+    screenGui = Instance.new("ScreenGui")
+    screenGui.Name           = "BCWOAutoRejoin"
+    screenGui.ResetOnSpawn   = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.DisplayOrder   = 999
+    screenGui.Parent         = playerGui
+
+    -- ============================================================
+    --  MAIN FRAME
+    -- ============================================================
+    local frame = Instance.new("Frame")
+    frame.Size                   = UDim2.new(0, 300, 0, 200)
+    frame.Position               = UDim2.new(0, 10, 0, 10)
+    frame.BackgroundColor3       = Color3.fromRGB(10, 10, 20)
+    frame.BackgroundTransparency = 0.15
+    frame.BorderSizePixel        = 0
+    frame.Active                 = true
+    frame.Draggable              = true
+    frame.Parent                 = screenGui
+    mainFrame = frame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = Color3.fromRGB(0, 200, 100)
+    stroke.Thickness = 1.5
+    stroke.Parent    = frame
+
+    -- ============================================================
+    --  TITLE BAR
+    -- ============================================================
+    local titleBar = Instance.new("Frame")
+    titleBar.Size             = UDim2.new(1, 0, 0, 30)
+    titleBar.BackgroundColor3 = Color3.fromRGB(0, 150, 70)
+    titleBar.BorderSizePixel  = 0
+    titleBar.Parent           = frame
+
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 8)
+    titleCorner.Parent       = titleBar
+
+    local titleFix = Instance.new("Frame")
+    titleFix.Size             = UDim2.new(1, 0, 0.5, 0)
+    titleFix.Position         = UDim2.new(0, 0, 0.5, 0)
+    titleFix.BackgroundColor3 = Color3.fromRGB(0, 150, 70)
+    titleFix.BorderSizePixel  = 0
+    titleFix.Parent           = titleBar
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size                   = UDim2.new(1, -70, 1, 0)
+    titleLabel.Position               = UDim2.new(0, 10, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text                   = "⚡ BCWO Auto Rejoin v10.0"
+    titleLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextSize               = 12
+    titleLabel.Font                   = Enum.Font.GothamBold
+    titleLabel.TextXAlignment         = Enum.TextXAlignment.Left
+    titleLabel.Parent                 = titleBar
+
+    -- ============================================================
+    --  MINIMIZE BUTTON (sa title bar, kanang bahagi)
+    -- ============================================================
+    local minimizeBtn = Instance.new("TextButton")
+    minimizeBtn.Size                   = UDim2.new(0, 28, 0, 22)
+    minimizeBtn.Position               = UDim2.new(1, -62, 0.5, -11)
+    minimizeBtn.BackgroundColor3       = Color3.fromRGB(255, 180, 0)
+    minimizeBtn.BorderSizePixel        = 0
+    minimizeBtn.Text                   = "—"
+    minimizeBtn.TextColor3             = Color3.fromRGB(0, 0, 0)
+    minimizeBtn.TextSize               = 14
+    minimizeBtn.Font                   = Enum.Font.GothamBold
+    minimizeBtn.Parent                 = titleBar
+
+    local minCorner = Instance.new("UICorner")
+    minCorner.CornerRadius = UDim.new(0, 4)
+    minCorner.Parent       = minimizeBtn
+
+    -- ============================================================
+    --  CLOSE/HIDE BUTTON (X)
+    -- ============================================================
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size                   = UDim2.new(0, 28, 0, 22)
+    closeBtn.Position               = UDim2.new(1, -30, 0.5, -11)
+    closeBtn.BackgroundColor3       = Color3.fromRGB(220, 50, 50)
+    closeBtn.BorderSizePixel        = 0
+    closeBtn.Text                   = "✕"
+    closeBtn.TextColor3             = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize               = 13
+    closeBtn.Font                   = Enum.Font.GothamBold
+    closeBtn.Parent                 = titleBar
+
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 4)
+    closeCorner.Parent       = closeBtn
+
+    -- ============================================================
+    --  CONTENT FRAME — ito ang nagtatago/nagpapakita
+    -- ============================================================
+    local contentFrame = Instance.new("Frame")
+    contentFrame.Size             = UDim2.new(1, 0, 1, -30)
+    contentFrame.Position         = UDim2.new(0, 0, 0, 30)
+    contentFrame.BackgroundTransparency = 1
+    contentFrame.BorderSizePixel  = 0
+    contentFrame.Parent           = frame
+
+    -- ============================================================
+    --  LABELS (nasa contentFrame na)
+    -- ============================================================
+    local yPos = 8
+    local function makeLabel(default)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size                   = UDim2.new(1, -16, 0, 22)
+        lbl.Position               = UDim2.new(0, 8, 0, yPos)
+        lbl.BackgroundTransparency = 1
+        lbl.Text                   = default
+        lbl.TextColor3             = Color3.fromRGB(200, 255, 200)
+        lbl.TextSize               = 13
+        lbl.Font                   = Enum.Font.Gotham
+        lbl.TextXAlignment         = Enum.TextXAlignment.Left
+        lbl.TextWrapped            = true
+        lbl.Parent                 = contentFrame
+        yPos = yPos + 24
+        return lbl
+    end
+
+    statusLabel = makeLabel("Status: 🟢 Running...")
+    biomeLabel  = makeLabel("Biome: Waiting...")
+    countLabel  = makeLabel("Rejoins: 0")
+
+    -- ============================================================
+    --  SERVER TIMER — VISIBLE COUNTDOWN BLOCK
+    -- ============================================================
+    -- Divider bago ang timer
+    local timerDivider = Instance.new("Frame")
+    timerDivider.Size                   = UDim2.new(1, -16, 0, 1)
+    timerDivider.Position               = UDim2.new(0, 8, 0, yPos)
+    timerDivider.BackgroundColor3       = Color3.fromRGB(0, 200, 100)
+    timerDivider.BackgroundTransparency = 0.6
+    timerDivider.BorderSizePixel        = 0
+    timerDivider.Parent                 = contentFrame
+    yPos = yPos + 6
+
+    -- Label: "SERVER TIMER"
+    local timerTitleLabel = Instance.new("TextLabel")
+    timerTitleLabel.Size                   = UDim2.new(1, -16, 0, 14)
+    timerTitleLabel.Position               = UDim2.new(0, 8, 0, yPos)
+    timerTitleLabel.BackgroundTransparency = 1
+    timerTitleLabel.Text                   = "SERVER TIMER"
+    timerTitleLabel.TextColor3             = Color3.fromRGB(150, 150, 180)
+    timerTitleLabel.TextSize               = 10
+    timerTitleLabel.Font                   = Enum.Font.GothamBold
+    timerTitleLabel.TextXAlignment         = Enum.TextXAlignment.Left
+    timerTitleLabel.Parent                 = contentFrame
+    yPos = yPos + 16
+
+    -- BIG countdown number
+    serverAgeLabel = Instance.new("TextLabel")
+    serverAgeLabel.Size                   = UDim2.new(1, -16, 0, 26)
+    serverAgeLabel.Position               = UDim2.new(0, 8, 0, yPos)
+    serverAgeLabel.BackgroundTransparency = 1
+    serverAgeLabel.Text                   = "29:00"
+    serverAgeLabel.TextColor3             = Color3.fromRGB(100, 255, 150)
+    serverAgeLabel.TextSize               = 18
+    serverAgeLabel.Font                   = Enum.Font.GothamBold
+    serverAgeLabel.TextXAlignment         = Enum.TextXAlignment.Center
+    serverAgeLabel.Parent                 = contentFrame
+    yPos = yPos + 28
+
+    -- Progress bar background
+    local timerBarBg = Instance.new("Frame")
+    timerBarBg.Size             = UDim2.new(1, -16, 0, 6)
+    timerBarBg.Position         = UDim2.new(0, 8, 0, yPos)
+    timerBarBg.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+    timerBarBg.BorderSizePixel  = 0
+    timerBarBg.Parent           = contentFrame
+
+    local timerBarBgCorner = Instance.new("UICorner")
+    timerBarBgCorner.CornerRadius = UDim.new(0, 4)
+    timerBarBgCorner.Parent       = timerBarBg
+
+    -- Progress bar fill (starts full = time remaining)
+    local timerBarFill = Instance.new("Frame")
+    timerBarFill.Size             = UDim2.new(1, 0, 1, 0)  -- starts full
+    timerBarFill.Position         = UDim2.new(0, 0, 0, 0)
+    timerBarFill.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+    timerBarFill.BorderSizePixel  = 0
+    timerBarFill.Parent           = timerBarBg
+
+    local timerBarFillCorner = Instance.new("UICorner")
+    timerBarFillCorner.CornerRadius = UDim.new(0, 4)
+    timerBarFillCorner.Parent       = timerBarFill
+
+    -- Sub-label: status sa ilalim ng bar ("Waiting..." / "HOLD — Rare: Irradiated")
+    local timerStatusLabel = Instance.new("TextLabel")
+    timerStatusLabel.Size                   = UDim2.new(1, -16, 0, 16)
+    timerStatusLabel.Position               = UDim2.new(0, 8, 0, yPos + 8)
+    timerStatusLabel.BackgroundTransparency = 1
+    timerStatusLabel.Text                   = "Waiting for biomes..."
+    timerStatusLabel.TextColor3             = Color3.fromRGB(150, 150, 180)
+    timerStatusLabel.TextSize               = 10
+    timerStatusLabel.Font                   = Enum.Font.Gotham
+    timerStatusLabel.TextXAlignment         = Enum.TextXAlignment.Center
+    timerStatusLabel.TextWrapped            = true
+    timerStatusLabel.Parent                 = contentFrame
+    yPos = yPos + 22
+
+    -- ✅ Separate loop para mag-update ang timer EVERY SECOND (hindi 5s)
+    -- Para makita mo talagang bumababa ang timer
+    task.spawn(function()
+        while _G.BCWO_Running do
+            task.wait(1)
+            if not isRunning then continue end
+
+            local elapsed   = tick() - serverJoinTime
+            local limit     = Settings.ServerAgeLimit
+            local remaining = math.max(0, limit - elapsed)
+            local progress  = math.max(0, math.min(1, remaining / limit))
+
+            -- Kulay ng bar at numero depende sa remaining time
+            local barColor, textColor, statusText
+
+            if elapsed >= limit and isRareBiomeActive then
+                -- HOLD state — rare biome aktibo, hindi mag-rerejoin
+                barColor   = Color3.fromRGB(100, 200, 255)   -- asul
+                textColor  = Color3.fromRGB(100, 200, 255)
+                statusText = "⏸️ HOLD — " .. (currentBiome or "Rare Biome")
+                serverAgeLabel.Text = "HOLD"
+
+            elseif remaining <= 0 then
+                -- Limit reached, walang rare biome (dapat nag-rerejoin na)
+                barColor   = Color3.fromRGB(255, 60, 60)
+                textColor  = Color3.fromRGB(255, 60, 60)
+                statusText = "⚠️ Limit reached!"
+                serverAgeLabel.Text = "00:00"
+
+            elseif remaining <= 300 then
+                -- < 5 minuto na lang — PULA, danger zone
+                barColor   = Color3.fromRGB(255, 80, 80)
+                textColor  = Color3.fromRGB(255, 100, 100)
+                statusText = "⚠️ Rejoin soon!"
+                serverAgeLabel.Text = formatTime(remaining)
+
+            elseif remaining <= 600 then
+                -- < 10 minuto — DILAW, babala
+                barColor   = Color3.fromRGB(255, 200, 0)
+                textColor  = Color3.fromRGB(255, 220, 80)
+                statusText = "Almost there..."
+                serverAgeLabel.Text = formatTime(remaining)
+
+            else
+                -- Normal — BERDE
+                barColor   = Color3.fromRGB(0, 200, 100)
+                textColor  = Color3.fromRGB(100, 255, 150)
+                statusText = "Auto-rejoin in " .. formatTime(remaining)
+                serverAgeLabel.Text = formatTime(remaining)
+            end
+
+            -- I-apply ang kulay
+            pcall(function()
+                serverAgeLabel.TextColor3  = textColor
+                timerBarFill.Size          = UDim2.new(progress, 0, 1, 0)
+                timerBarFill.BackgroundColor3 = barColor
+                timerStatusLabel.Text      = statusText
+                timerStatusLabel.TextColor3 = textColor
+            end)
+        end
+    end)
+
+    local webhookLabel = Instance.new("TextLabel")
+    webhookLabel.Size                   = UDim2.new(1, -16, 0, 20)
+    webhookLabel.Position               = UDim2.new(0, 8, 0, yPos)
+    webhookLabel.BackgroundTransparency = 1
+    webhookLabel.Text                   = WEBHOOK_URL:find("YOUR_WEBHOOK") and "⚠️ Webhook: NOT SET" or "✅ Webhook: Active"
+    webhookLabel.TextColor3             = WEBHOOK_URL:find("YOUR_WEBHOOK") and Color3.fromRGB(255, 100, 100) or Color3.fromRGB(100, 255, 150)
+    webhookLabel.TextSize               = 11
+    webhookLabel.Font                   = Enum.Font.Gotham
+    webhookLabel.TextXAlignment         = Enum.TextXAlignment.Left
+    webhookLabel.Parent                 = contentFrame
+    yPos = yPos + 24
+
+    local divider = Instance.new("Frame")
+    divider.Size                    = UDim2.new(1, -16, 0, 1)
+    divider.Position                = UDim2.new(0, 8, 0, yPos)
+    divider.BackgroundColor3        = Color3.fromRGB(0, 200, 100)
+    divider.BackgroundTransparency  = 0.5
+    divider.BorderSizePixel         = 0
+    divider.Parent                  = contentFrame
+    yPos = yPos + 8
+
+    local hintLabel = Instance.new("TextLabel")
+    hintLabel.Size                   = UDim2.new(1, -16, 0, 20)
+    hintLabel.Position               = UDim2.new(0, 8, 0, yPos)
+    hintLabel.BackgroundTransparency = 1
+    hintLabel.Text                   = "🔑 RightShift = Show/Hide GUI"
+    hintLabel.TextColor3             = Color3.fromRGB(180, 180, 255)
+    hintLabel.TextSize               = 11
+    hintLabel.Font                   = Enum.Font.Gotham
+    hintLabel.TextXAlignment         = Enum.TextXAlignment.Left
+    hintLabel.Parent                 = contentFrame
+    yPos = yPos + 24
+
+    -- ============================================================
+    --  SHOW BUTTON — lilitaw kapag naka-hide ang GUI
+    --  (maliit na berdeng button sa gilid ng screen)
+    -- ============================================================
+    local showBtn = Instance.new("TextButton")
+    showBtn.Size                   = UDim2.new(0, 36, 0, 36)
+    showBtn.Position               = UDim2.new(0, 5, 0, 5)
+    showBtn.BackgroundColor3       = Color3.fromRGB(0, 150, 70)
+    showBtn.BorderSizePixel        = 0
+    showBtn.Text                   = "⚡"
+    showBtn.TextSize               = 18
+    showBtn.Font                   = Enum.Font.GothamBold
+    showBtn.TextColor3             = Color3.fromRGB(255, 255, 255)
+    showBtn.Visible                = false   -- nakatago sa simula
+    showBtn.Parent                 = screenGui
+    showBtn.ZIndex                 = 10
+
+    local showBtnCorner = Instance.new("UICorner")
+    showBtnCorner.CornerRadius = UDim.new(0, 8)
+    showBtnCorner.Parent       = showBtn
+
+    local showBtnStroke = Instance.new("UIStroke")
+    showBtnStroke.Color     = Color3.fromRGB(0, 255, 120)
+    showBtnStroke.Thickness = 1.5
+    showBtnStroke.Parent    = showBtn
+
+    -- ============================================================
+    --  TOGGLE LOGIC
+    -- ============================================================
+    local fullHeight  = yPos + 10 + 30  -- content + titlebar
+    frame.Size = UDim2.new(0, 300, 0, fullHeight)
+
+    local function hideGUI()
+        isGuiHidden       = true
+        frame.Visible     = false
+        showBtn.Visible   = true
+        print("[GUI] Naka-hide na. I-click ang ⚡ button o pindutin ang RightShift para ishow ulit.")
+    end
+
+    local function showGUI()
+        isGuiHidden       = false
+        frame.Visible     = true
+        showBtn.Visible   = false
+        print("[GUI] Nakita na ulit ang GUI.")
+    end
+
+    local isMinimized    = false
+    local normalHeight   = fullHeight
+
+    local function toggleMinimize()
+        if isMinimized then
+            -- I-restore
+            frame.Size    = UDim2.new(0, 300, 0, normalHeight)
+            contentFrame.Visible = true
+            minimizeBtn.Text     = "—"
+            isMinimized          = false
+        else
+            -- I-minimize (title bar lang ang makikita)
+            frame.Size    = UDim2.new(0, 300, 0, 30)
+            contentFrame.Visible = false
+            minimizeBtn.Text     = "□"
+            isMinimized          = true
+        end
+    end
+
+    -- Buttons
+    minimizeBtn.MouseButton1Click:Connect(toggleMinimize)
+    closeBtn.MouseButton1Click:Connect(hideGUI)
+    showBtn.MouseButton1Click:Connect(showGUI)
+
+    -- ✅ RightShift keybind — toggle hide/show
+    UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            if isGuiHidden then
+                showGUI()
+            else
+                hideGUI()
+            end
+        end
+    end)
+
+    -- ✅ Console toggle para rin
+    _G.BCWO_ToggleGUI = function()
+        if isGuiHidden then showGUI() else hideGUI() end
+    end
+
+    print("[GUI] ✅ GUI loaded. Controls:")
+    print("[GUI]   — button    = Minimize/Restore")
+    print("[GUI]   ✕ button    = Hide (maliit na ⚡ button ang lilitaw)")
+    print("[GUI]   RightShift  = Toggle Show/Hide")
+    print("[GUI]   Console: _G.BCWO_ToggleGUI() = Toggle")
+end
+
+-- ============================================================
+--  ANTI-AFK
+-- ============================================================
+local function startAntiAFK()
+    local VirtualUser = game:GetService("VirtualUser")
+    local player      = Players.LocalPlayer
+
+    player.Idled:Connect(function()
+        VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+    end)
+
+    task.spawn(function()
+        while _G.BCWO_Running do
+            task.wait(120)
+            pcall(function()
+                VirtualUser:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+                task.wait(0.5)
+                VirtualUser:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+--  DIRECT BCWO BIOME CHECK — Basahin ang actual game variable
+--  ng BCWO para malaman ang current biome kahit walang message
+-- ============================================================
+local function getActiveBiomeFromGame()
+    -- Try to read BCWO's internal biome variable directly
+    local biomeText = nil
+
+    pcall(function()
+        -- Method 1: Check ReplicatedStorage para sa biome value
+        local rs = game:GetService("ReplicatedStorage")
+        for _, obj in ipairs(rs:GetDescendants()) do
+            if obj:IsA("StringValue") or obj:IsA("ValueBase") then
+                local v = tostring(obj.Value):lower()
+                if #v > 3 then
+                    local isPreHM = containsAny(v, PREHARDMODE_MESSAGES)
+                    if isPreHM then biomeText = v return end
+                    local isRare = containsAny(v, RARE_MESSAGES)
+                    if isRare then biomeText = v return end
+                end
+            end
+        end
+    end)
+
+    if biomeText then return biomeText end
+
+    pcall(function()
+        -- Method 2: Check PlayerGui chat logs / system messages
+        local playerGui = Players.LocalPlayer:WaitForChild("PlayerGui", 3)
+        if not playerGui then return end
+        for _, obj in ipairs(playerGui:GetDescendants()) do
+            if (obj:IsA("TextLabel") or obj:IsA("TextBox")) and obj.Visible then
+                local text = obj.Text
+                if text and #text > 5 then
+                    local isPreHM = containsAny(text, PREHARDMODE_MESSAGES)
+                    if isPreHM then biomeText = text return end
+                    local isRare = containsAny(text, RARE_MESSAGES)
+                    if isRare then biomeText = text return end
+                end
+            end
+        end
+    end)
+
+    return biomeText
+end
+
+-- ============================================================
+--  SERVER AGE AUTO-REJOIN
+--  Logic (v22 — UPDATED):
+--    • Bibilangin ang oras mula nang mag-join sa server
+--    • Pagdating ng 1 oras (ServerAgeLimit):
+--        - Pre-HM biome   → mag-rejoin AGAD (nag-rerejoin na rin siya sa Pre-HM)
+--        - Grasslands     → mag-rejoin AGAD
+--        - Rare/HM biome  → PRESKIP — hindi mag-rerejoin, hihintay hanggang
+--                           mawala ang rare biome bago mag-rejoin
+-- ============================================================
+-- formatTime moved to top (before createGUI)
+
+local function webhookServerAge(reason)
+    sendWebhook(
+        "⏰ Server Age — Auto Rejoin",
+        "Server ay **29 minuto** na — nagrerejoin para sa mas bagong server.",
+        16776960,
+        {
+            { name = "⏱️ Server Age", value = formatTime(tick() - serverJoinTime), inline = true },
+            { name = "🌍 Biome",      value = currentBiome or "Unknown",           inline = true },
+            { name = "🔁 Reason",     value = reason or "29-Min Limit",            inline = true },
+        },
+        true
+    )
+end
+
+local function startServerAgeTimer()
+    if not Settings.ServerAgeRejoin then
+        print("[SERVER AGE] Timer ay naka-OFF sa Settings.")
+        return
+    end
+
+    task.spawn(function()
+        print("[SERVER AGE] ✅ Timer started. Mag-rerejoin after " .. formatTime(Settings.ServerAgeLimit) .. " (Pre-HM/Grasslands). Rare biomes = HOLD.")
+
+        local rareSkipLogged = false  -- para isang beses lang mag-print ang rare skip message
+
+        while _G.BCWO_Running do
+            task.wait(5)  -- i-check bawat 5 segundo
+
+            if not isRunning then continue end
+
+            local elapsed   = tick() - serverJoinTime
+            local remaining = Settings.ServerAgeLimit - elapsed
+            local limitStr  = formatTime(Settings.ServerAgeLimit)
+
+            -- ── Hindi pa umabot sa 1 oras ────────────────────────────
+            -- (GUI update ay ginagawa ng sariling 1-second loop sa createGUI)
+            if elapsed < Settings.ServerAgeLimit then
+                rareSkipLogged = false  -- i-reset ang log flag
+                if math.floor(elapsed) % 600 == 0 and math.floor(elapsed) > 0 then
+                    print("[SERVER AGE] " .. formatTime(elapsed) .. " / " .. limitStr
+                        .. " — " .. formatTime(remaining) .. " na lang.")
+                end
+                continue
+            end
+
+            -- ── 29 minuto na! ────────────────────────────────────────
+
+            -- Kung nag-rerejoin na at aktibo pa, hintayin matapos
+            -- pero huwag mag-block forever
+            if isRejoinPending then
+                print("[SERVER AGE] May pending rejoin na — naghihintay...")
+                continue
+            end
+
+            -- ── May Rare/HM biome → PRESKIP, hintayin mawala ────────
+            if isRareBiomeActive then
+                if not rareSkipLogged then
+                    rareSkipLogged = true
+                    print("[SERVER AGE] ⏸️ 29 min na! May Rare/HM biome (" .. currentBiome
+                        .. ") — hindi mag-rerejoin. Hihintay mawala ang biome.")
+                    notify(
+                        "⏸️ 29 Min — On Hold",
+                        "May Rare biome — hihintay mawala bago mag-rejoin.",
+                        8
+                    )
+                end
+                continue  -- bumalik, hintay mawala ang rare biome
+
+            -- ── Pre-HM / Grasslands / Walang biome → mag-rejoin AGAD ─
+            else
+                rareSkipLogged = false
+                print("[SERVER AGE] ✅ 29 min na! Mag-rerejoin agad! (Biome: " .. currentBiome .. ")")
+                notify(
+                    "⏰ 29 Min Server Limit!",
+                    "Mag-rerejoin sa bagong server! (Biome: " .. currentBiome .. ")",
+                    5
+                )
+                webhookServerAge("29-min limit — " .. currentBiome)
+                isRejoinPending = true
+                doRejoin("29-min server age limit (" .. currentBiome .. ")")
+                return
+            end
+        end
+    end)
+end
+
+-- ============================================================
+--  CONTINUOUS BIOME POLL — Loop na nag-c-check every 0.5s
+--  para hindi ma-miss kahit kakaload palang ng script
+-- ============================================================
+local function startBiomePoller()
+    task.spawn(function()
+        local lastPolledText = ""  -- ✅ FIX v12: Dedup para hindi spam-rejoin ang poller
+        local lastJobId = game.JobId  -- ✅ FIX v25: track server para ma-reset dedup
+        while _G.BCWO_Running do
+            task.wait(0.5)
+            if not isRunning then continue end
+
+            -- ✅ FIX v25: I-reset ang dedup kapag bagong server na
+            if game.JobId ~= lastJobId then
+                lastJobId = game.JobId
+                lastPolledText = ""
+            end
+
+            pcall(function()
+                -- Poll ReplicatedStorage for biome string values
+                local rs = game:GetService("ReplicatedStorage")
+                for _, obj in ipairs(rs:GetDescendants()) do
+                    if obj:IsA("StringValue") then
+                        local v = obj.Value
+                        if v and #v > 5 then
+                            -- ✅ FIX v12: I-clean ang value bago i-check (removes font/HTML tags)
+                            local cleaned = cleanMessage(v)
+                            if cleaned == lastPolledText then continue end  -- skip duplicates
+
+                            local isPreHM, preHMPhrase = containsAny(cleaned, PREHARDMODE_MESSAGES)
+                            if isPreHM then
+                                -- ✅ FIX v25: HUWAG i-block ng isRejoinPending — kung Pre-HM,
+                                -- palaging mag-rejoin kahit may pending na (baka iba ang dahilan)
+                                lastPolledText = cleaned           -- ✅ FIX v12: record before rejoin
+                                isRejoinPending = true              -- 🔒 I-lock agad
+                                local triggerMsg = preHMPhrase or cleaned
+                                print("[POLLER] Pre-HM detected via RS! Phrase: " .. triggerMsg)
+                                updateStatus("⚔️ Pre-HM (Polled)! Rejoining...", triggerMsg:sub(1,40))
+                                notify("⚔️ Pre-HM Detected!", "Switching server...", 3)
+                                webhookBiome("PREHM", triggerMsg)
+                                task.spawn(function() doRejoin(triggerMsg) end)
+                                return
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end)
+end
+
+-- ============================================================
+--  START
+-- ============================================================
+local function start()
+    isRunning = true
+    isRareBiomeActive = false  -- ← I-reset lagi sa bagong server
+    isRejoinPending   = false  -- ← I-reset ang rejoin lock sa bagong server
+    isRejoinPending   = false
+    lastBiomeNotified = ""
+
+    -- ✅ I-sync ang rejoinCount mula sa _G (persistent kahit mag-rejoin)
+    rejoinCount = _G.BCWO_RejoinCount or 0
+
+    createGUI()
+    updateStatus("🟢 Running...", "Waiting for biome...")
+
+    -- Send startup webhook
+    sendWebhook(
+        "✅ BCWO Auto Rejoin Started!",
+        "Script ay na-load na at nag-iikot na.",
+        3066993,
+        {
+            { name = "📍 Place ID",    value = tostring(game.PlaceId), inline = true },
+            { name = "🌐 Server ID",   value = tostring(game.JobId):sub(1, 16) .. "...", inline = true },
+            { name = "🔔 Biome Alert", value = Settings.WebhookBiome and "ON" or "OFF", inline = true },
+            { name = "🎒 Item Alert",  value = Settings.WebhookItems and "ON" or "OFF", inline = true },
+        }
+    )
+
+    -- ⏱️ I-reset ang server age timer sa bawat bagong server
+    serverJoinTime = tick()
+    startAntiAFK()
+    hookChat()
+    scanForBiomeInGUI()
+    scanWorkspaceForBiomes()
+    scanCurrentBiomeOnLoad()  -- ✅ FIX v15: Immediate scan ng current biome sa load
+    startBiomePoller()
+    startServerAgeTimer()     -- ⏱️ v21: 1-hour server age auto-rejoin
+
+    notify(
+        "⚡ BCWO Auto Rejoin v5.0 [TRUE IY + WEBHOOK]",
+        "✓ Kick Self → TeleportToNewServer\n✓ AUTOMATIC Pre-HM Rejoin\n✓ Discord Webhook Active",
+        8
+    )
+
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║  BCWO AUTO REJOIN v5.0 [TRUE IY + DISCORD WEBHOOK]        ║")
+    print("╠═══════════════════════════════════════════════════════════╣")
+    print("║ Webhook Status: " .. (WEBHOOK_URL:find("YOUR_WEBHOOK") and "❌ NOT SET" or "✅ ACTIVE") .. "                               ║")
+    print("║                                                           ║")
+    print("║ Webhook Events:                                           ║")
+    print("║   ✓ Biome Spawn (Rare / Pre-HM / Grasslands)             ║")
+    print("║   ✓ Item Drops                                           ║")
+    print("║   ✓ Auto Rejoin Triggered                                ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
+
+    if WEBHOOK_URL:find("YOUR_WEBHOOK") then
+        warn("⚠️ [WEBHOOK] Hindi pa na-set ang WEBHOOK_URL! Buksan ang script at palitan ang WEBHOOK_URL sa taas.")
+    end
+end
+
+-- RUN!
+start()
